@@ -1,0 +1,23 @@
+node_modules/
+dist/
+# Build OUTPUT only. backend/build/ holds committed build-time SOURCE (the
+# mikro-orm stub esbuild aliases), so it must not be ignored.
+/build/
+frontend/build/
+.aws-sam/
+*.log
+.env
+.env.*
+!.env.example
+packaged.yaml
+*.zip
+.DS_Store
+coverage/
+backend/artifact/
+frontend/.vite/
+.localelock/
+*.pem
+*.json.key
+gcp-sa*.json
+.venv/
+backend/.venv/

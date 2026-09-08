@@ -1,0 +1,35 @@
+{
+  "name": "localelock-live-backend",
+  "private": true,
+  "version": "0.1.0",
+  "description": "LocaleLock Live backend - release-gate API + worker (AWS Lambda / local node:http)",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "tsx watch src/local/server.ts",
+    "start": "tsx src/local/server.ts",
+    "build": "bash scripts/build.sh",
+    "test": "node --import tsx --test test/*.test.ts",
+    "seed": "tsx src/cli/seed.ts",
+    "reset": "tsx src/cli/reset.ts",
+    "run-gate": "tsx src/cli/run.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@clickhouse/client": "1.23.1",
+    "@aws-sdk/client-lambda": "^3.700.0",
+    "@aws-sdk/client-ssm": "^3.700.0",
+    "@google/adk": "2.0.0",
+    "@google/genai": "2.21.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

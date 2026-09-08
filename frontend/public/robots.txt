@@ -1,0 +1,9 @@
+# LocaleLock Live - a hackathon demo. Crawling the app is pointless (every page
+# is rendered client-side from a live API) and the run endpoints cost money.
+User-agent: *
+Allow: /$
+Allow: /judge
+Disallow: /gate
+Disallow: /api/
+
+Sitemap: /sitemap.xml

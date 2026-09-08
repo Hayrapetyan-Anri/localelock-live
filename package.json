@@ -1,0 +1,20 @@
+{
+  "name": "localelock-live",
+  "private": true,
+  "version": "0.1.0",
+  "description": "LocaleLock Live - release-control tower for multilingual film subtitles (hackathon build)",
+  "license": "MIT",
+  "scripts": {
+    "install:all": "npm --prefix backend install && npm --prefix backend/mcp-runtime install && npm --prefix frontend install",
+    "dev": "npm --prefix backend run dev & npm --prefix frontend run dev & wait",
+    "dev:api": "npm --prefix backend run dev",
+    "dev:web": "npm --prefix frontend run dev",
+    "build": "npm --prefix backend run build && npm --prefix frontend run build",
+    "test": "npm --prefix backend test",
+    "seed": "npm --prefix backend run seed",
+    "reset": "npm --prefix backend run reset",
+    "run-gate": "npm --prefix backend run run-gate",
+    "e2e": "bash scripts/e2e-local.sh",
+    "deploy": "bash scripts/deploy.sh"
+  }
+}

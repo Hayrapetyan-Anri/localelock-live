@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Clean clone builds and tests
+    runs-on: ubuntu-latest
+
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:latest
+        ports:
+          - 8123:8123
+        env:
+          CLICKHOUSE_PASSWORD: localdev
+          CLICKHOUSE_DB: localelock
+
+    env:
+      CLICKHOUSE_HOST: 127.0.0.1
+      CLICKHOUSE_PORT: '8123'
+      CLICKHOUSE_SECURE: 'false'
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: localdev
+      CLICKHOUSE_DATABASE: localelock
+      CLICKHOUSE_AGENT_USER: default
+      CLICKHOUSE_AGENT_PASSWORD: localdev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install backend
+        run: npm --prefix backend install --no-audit --no-fund
+
+      - name: Install frontend
+        run: npm --prefix frontend install --no-audit --no-fund
+
+      - name: Install the official mcp-clickhouse server
+        run: |
+          python3 -m venv backend/.venv
+          backend/.venv/bin/pip install --quiet mcp-clickhouse==0.6.0
+          test -x backend/.venv/bin/mcp-clickhouse
+
+      - name: Wait for ClickHouse
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf -u default:localdev 'http://127.0.0.1:8123/?query=SELECT%201' && break
+            sleep 2
+          done
+          curl -sf -u default:localdev 'http://127.0.0.1:8123/?query=SELECT%20version()'
+
+      - name: Seed the demo dataset
+        run: npm --prefix backend run seed -- --force
+
+      - name: Typecheck backend
+        run: npm --prefix backend run typecheck
+
+      - name: Typecheck frontend
+        run: npx --prefix frontend tsc --noEmit -p frontend/tsconfig.json
+
+      - name: Backend tests
+        run: npm --prefix backend test 2>&1 | tee /tmp/test.log
+
+      - name: The ClickHouse/MCP tests must not have been skipped
+        run: |
+          if grep -qE '^. skipped [1-9]' /tmp/test.log; then
+            echo "Sponsor-critical tests skipped in CI:"; grep -A2 'skipped' /tmp/test.log; exit 1
+          fi
+          grep -q 'single mcp-clickhouse process' /tmp/test.log || { echo "pooling test did not run"; exit 1; }
+          grep -q 'refuses writes' /tmp/test.log || { echo "write-refusal test did not run"; exit 1; }
+
+      - name: Build Lambda artifact
+        run: npm --prefix backend run build
+
+      - name: Build frontend
+        run: npm --prefix frontend run build
+
+      - name: Artifact must contain both handlers
+        run: |
+          test -f backend/artifact/api.mjs
+          test -f backend/artifact/worker.mjs
+          test -f backend/artifact/build-info.json
+
+      - name: Nothing needed for the build may be gitignored
+        run: |
+          git clean -xdf --dry-run | grep -vE 'node_modules|artifact|dist|\.venv' > /tmp/untracked.txt || true
+          if [ -s /tmp/untracked.txt ]; then
+            echo "Untracked files the build may depend on:"; cat /tmp/untracked.txt; exit 1
+          fi
+
+  docker:
+    name: Lambda image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm --prefix backend install --no-audit --no-fund
+      - run: npm --prefix backend run build
+      - name: Build the container image (Node + uv-managed Python + mcp-clickhouse)
+        run: docker build --platform linux/amd64 -t localelock-live:ci backend
+      - name: The official MCP server must be present and executable
+        run: docker run --rm --entrypoint sh localelock-live:ci -c 'test -x "$MCP_CLICKHOUSE_BIN" && echo "$MCP_CLICKHOUSE_BIN ok"'

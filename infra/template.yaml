@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  LocaleLock Live - release-control tower for multilingual film subtitles.
+  API Gateway HTTP API + two Lambda functions (sync API, async worker) built from
+  one artifact, secrets in SSM Parameter Store, static frontend on S3 + CloudFront.
+  Deployed with plain `aws cloudformation package/deploy` (see scripts/deploy.sh).
+
+Parameters:
+  SsmPrefix:
+    Type: String
+    Default: /localelock-live
+    Description: >-
+      SSM Parameter Store prefix that holds the SecureString secrets
+      (clickhouse-host, clickhouse-user, clickhouse-password, clickhouse-agent-user,
+      clickhouse-agent-password, gcp-sa-json, demo-admin-key, gemini-api-key).
+      One path segment with a leading slash, e.g. /localelock-live.
+    AllowedPattern: '^/[A-Za-z0-9_.-]+$'
+    ConstraintDescription: must be a single path segment with a leading slash, e.g. /localelock-live
+  ClickHouseDatabase:
+    Type: String
+    Default: localelock
+    Description: ClickHouse database that holds the catalog, evidence and release state.
+  ClickHousePort:
+    Type: String
+    Default: '8443'
+    Description: ClickHouse HTTPS port (8443 for ClickHouse Cloud).
+  ClickHouseSecure:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Use TLS when connecting to ClickHouse.
+  ImageUri:
+    Type: String
+    Description: >-
+      ECR image URI for both Lambda functions, built from backend/Dockerfile
+      (Lambda Node 22 base + Python + the official mcp-clickhouse server).
+      scripts/deploy.sh builds, pushes and passes this.
+  GoogleCloudProject:
+    Type: String
+    Default: ''
+    Description: Google Cloud project id used for Vertex AI (Gemini via Google ADK). Empty disables Vertex.
+  GoogleCloudLocation:
+    Type: String
+    Default: us-central1
+    Description: Vertex AI location.
+  GeminiModel:
+    Type: String
+    Default: gemini-2.5-flash
+    Description: Gemini model id used by both ADK agents.
+  ResetRequiresKey:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: When 'true', POST /admin/reset requires the X-Demo-Key header.
+  PublicRepoUrl:
+    Type: String
+    Default: ''
+    Description: Public source repository URL shown on the /judge route (optional).
+  Stage:
+    Type: String
+    Default: prod
+    Description: Deployment stage label (tags and the STAGE env var).
+
+Conditions:
+  HasGoogleCloudProject: !Not [!Equals [!Ref GoogleCloudProject, '']]
+  HasPublicRepoUrl: !Not [!Equals [!Ref PublicRepoUrl, '']]
+
+Globals:
+  Function:
+    Architectures: [x86_64]
+    Tags:
+      project: localelock-live
+      stage: !Ref Stage
+    Environment:
+      Variables:
+        CLICKHOUSE_DATABASE: !Ref ClickHouseDatabase
+        CLICKHOUSE_PORT: !Ref ClickHousePort
+        CLICKHOUSE_SECURE: !Ref ClickHouseSecure
+        GOOGLE_CLOUD_PROJECT: !If [HasGoogleCloudProject, !Ref GoogleCloudProject, !Ref AWS::NoValue]
+        GOOGLE_CLOUD_LOCATION: !Ref GoogleCloudLocation
+        GEMINI_MODEL: !Ref GeminiModel
+        SSM_PREFIX: !Ref SsmPrefix
+        RESET_REQUIRES_KEY: !Ref ResetRequiresKey
+        PUBLIC_REPO_URL: !If [HasPublicRepoUrl, !Ref PublicRepoUrl, !Ref AWS::NoValue]
+        STAGE: !Ref Stage
+        NODE_OPTIONS: --enable-source-maps
+
+Resources:
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      Description: LocaleLock Live JSON API
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [content-type, x-demo-key]
+        MaxAge: 600
+      Tags:
+        project: localelock-live
+        stage: !Ref Stage
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-api'
+      RetentionInDays: 14
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-worker'
+      RetentionInDays: 14
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: LocaleLock Live API (sync). Enqueues release-gate runs on the worker.
+      PackageType: Image
+      ImageUri: !Ref ImageUri
+      ImageConfig:
+        Command: [api.handler]
+      MemorySize: 2048
+      Timeout: 29
+      LoggingConfig:
+        LogGroup: !Ref ApiLogGroup
+      Environment:
+        Variables:
+          WORKER_FUNCTION_NAME: !Ref WorkerFunction
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref WorkerFunction
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub
+              - '${Name}/*'
+              - Name: !Select [1, !Split ['/', !Ref SsmPrefix]]
+      Events:
+        ProxyRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+        RootRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /
+            Method: ANY
+        Warmup:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Keep the API warm and the catalog scan primed
+            Enabled: true
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: LocaleLock Live worker (async). Executes release-gate runs and seeds.
+      PackageType: Image
+      ImageUri: !Ref ImageUri
+      ImageConfig:
+        Command: [worker.handler]
+      MemorySize: 1536
+      Timeout: 600
+      LoggingConfig:
+        LogGroup: !Ref WorkerLogGroup
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub
+              - '${Name}/*'
+              - Name: !Select [1, !Split ['/', !Ref SsmPrefix]]
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: project
+          Value: localelock-live
+        - Key: stage
+          Value: !Ref Stage
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-frontend-oac'
+        Description: Lets the LocaleLock Live distribution read the private frontend bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} frontend (Vite build)'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: api-gateway
+            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 60
+          - Id: frontend-s3
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api-gateway
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        DefaultCacheBehavior:
+          TargetOriginId: frontend-s3
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: project
+          Value: localelock-live
+        - Key: stage
+          Value: !Ref Stage
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the HTTP API ($default stage, no trailing slash)
+    Value: !GetAtt HttpApi.ApiEndpoint
+  FrontendUrl:
+    Description: CloudFront URL of the frontend (hero route)
+    Value: !Sub 'https://${Distribution.DomainName}'
+  JudgeUrl:
+    Description: CloudFront URL of the /judge route
+    Value: !Sub 'https://${Distribution.DomainName}/judge'
+  FrontendBucket:
+    Description: S3 bucket that holds the Vite build (private; sync with scripts/deploy.sh)
+    Value: !Ref FrontendBucket
+  DistributionId:
+    Description: CloudFront distribution id (for invalidations)
+    Value: !Ref Distribution
+  WorkerFunctionName:
+    Description: Name of the async worker Lambda function
+    Value: !Ref WorkerFunction
+  ApiFunctionName:
+    Description: Name of the API Lambda function
+    Value: !Ref ApiFunction
